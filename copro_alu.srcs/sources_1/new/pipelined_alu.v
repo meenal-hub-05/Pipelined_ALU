@@ -22,14 +22,14 @@ module pipelined_alu(
     reg [7:0]  IF_ID_pc;
  
     // ID/EX
-    reg [7:0]  ID_EX_A, ID_EX_B;
+    reg [7:0]  ID_EX_A, ID_EX_B,ID_EX_branch_target;
     reg [2:0]  ID_EX_rd, ID_EX_rs1, ID_EX_rs2;
     reg [3:0]  ID_EX_opcode;
     reg        ID_EX_regWrite, ID_EX_memRead, ID_EX_memWrite, ID_EX_isBranch;
     reg [8:0]  ID_EX_imm9;
  
     // EX/MEM
-    reg [7:0]  EX_MEM_alu_out, EX_MEM_B;
+    reg [7:0]  EX_MEM_alu_out, EX_MEM_B, EX_MEM_branch_target;
     reg [2:0]  EX_MEM_rd;
     reg        EX_MEM_regWrite, EX_MEM_memRead, EX_MEM_memWrite, EX_MEM_isBranch;
     reg        EX_MEM_Z;
@@ -56,7 +56,12 @@ module pipelined_alu(
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             pc          <= 0;
-            IF_ID_instr <= 0;
+            IF_ID_instr <= 16'hFFFF;
+            IF_ID_pc    <= 0;
+        end
+        else if (flush) begin
+            pc          <= EX_MEM_branch_target;  // redirect to branch target
+            IF_ID_instr <= 16'hFFFF;              // kill the instruction in IF
             IF_ID_pc    <= 0;
         end
         else if (!stall) begin
@@ -90,6 +95,7 @@ module pipelined_alu(
             ID_EX_rs1      <= 0;
             ID_EX_rs2      <= 0;
             ID_EX_imm9     <= 9'b0;
+            ID_EX_branch_target <= 8'b0;
         end
         else begin
             ID_EX_A        <= regfile[rs1];
@@ -104,6 +110,7 @@ module pipelined_alu(
             ID_EX_memWrite <= (opcode == 4'b1001); // ST
             ID_EX_isBranch <= (opcode == 4'b1100); // BEQ
             ID_EX_imm9     <= imm9;
+            ID_EX_branch_target <= imm9[7:0];
         end
     end
  
@@ -137,7 +144,7 @@ module pipelined_alu(
             4'b0011: alu_out_comb = fwd_A | fwd_B;                         // OR
             4'b0100: alu_out_comb = fwd_A ^ fwd_B;                         // XOR
             4'b0101: alu_out_comb = fwd_A;                                  // MOV
-            4'b1010: alu_out_comb = acc[7:0] + (fwd_A * fwd_B);            // MAC (lower 8 bits for forwarding)
+            4'b1010: alu_out_comb = (acc + ({8'b0, fwd_A} * {8'b0, fwd_B}));
             default: alu_out_comb = 8'b0;                                   // NOP and others: no output
         endcase
  
@@ -148,6 +155,21 @@ module pipelined_alu(
  
     // Sequential: EX → MEM pipeline register + flag update + MAC accumulator
     always @(posedge clk) begin
+    if (flush) begin
+        // Squash the instruction currently in EX (it's the first wrong instruction
+        // after the branch - kill its control signals before they reach MEM)
+        EX_MEM_regWrite      <= 0;
+        EX_MEM_memWrite      <= 0;
+        EX_MEM_memRead       <= 0;
+        EX_MEM_isBranch      <= 0;   // critical: don't chain a second flush
+        EX_MEM_alu_out       <= 0;
+        EX_MEM_B             <= 0;
+        EX_MEM_rd            <= 0;
+        EX_MEM_Z             <= 0;
+        EX_MEM_addr          <= 0;
+        EX_MEM_branch_target <= 0;
+    end
+    else begin
         EX_MEM_alu_out  <= alu_out_comb;
         EX_MEM_rd       <= ID_EX_rd;
         EX_MEM_regWrite <= ID_EX_regWrite;
@@ -156,6 +178,8 @@ module pipelined_alu(
         EX_MEM_isBranch <= ID_EX_isBranch;
         EX_MEM_Z        <= alu_Z_comb;
         EX_MEM_addr     <= ID_EX_imm9[7:0];
+        EX_MEM_branch_target <= ID_EX_branch_target;
+        EX_MEM_Z <= (ID_EX_isBranch) ? Z : alu_Z_comb;
  
         // Store source forwarding
         if (ID_EX_opcode == 4'b1001)
@@ -165,7 +189,7 @@ module pipelined_alu(
  
         // FIX 1: MAC uses full 16-bit accumulator - no silent truncation
         if (ID_EX_opcode == 4'b1010)
-            acc <= acc + (fwd_A * fwd_B);
+            acc <= acc + ({8'b0, fwd_A} * {8'b0, fwd_B});
  
         // FIX 2: Only update flags for real ALU or MAC instructions - NOT for NOP (4'b1111)
         // This prevents zero-instructions from clobbering flags after the program ends
@@ -175,6 +199,7 @@ module pipelined_alu(
             S <= alu_S_comb;
             P <= alu_P_comb;
         end
+    end
     end
  
     //-------------------------
@@ -212,7 +237,12 @@ module pipelined_alu(
     // Hazard Detection
     //-------------------------
     // Stall on load-use hazard: LD in EX, dependent instruction in ID
-    assign stall = (ID_EX_memRead && ((ID_EX_rd == rs1) || (ID_EX_rd == rs2)));
+    assign stall = (ID_EX_memRead && (
+        (ID_EX_rd == rs1) || 
+        (ID_EX_rd == rs2) ||
+        // Also stall if a ST in decode needs the just-loaded value
+        (opcode == 4'b1001 && ID_EX_rd == IF_ID_instr[11:9])
+    ));
  
     // Flush on taken branch
     assign flush = (EX_MEM_isBranch && EX_MEM_Z);
